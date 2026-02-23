@@ -1,5 +1,5 @@
 import os
-import requests
+import cv2
 import numpy as np
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
@@ -7,115 +7,71 @@ from aiogram.enums import ParseMode
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not found")
-
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-BINANCE_BASES = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://data-api.binance.vision",
-]
 
+def analyze_and_draw(path: str) -> str:
+    img = cv2.imread(path)
+    h, w = img.shape[:2]
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200):
-    url_path = "/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
 
-    for base in BINANCE_BASES:
-        try:
-            r = requests.get(f"{base}{url_path}", params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                closes = np.array([float(x[4]) for x in data])
-                highs = np.array([float(x[2]) for x in data])
-                lows = np.array([float(x[3]) for x in data])
-                return closes, highs, lows
-        except:
-            continue
+    # -------- Горизонтальные уровни --------
+    projection = edges.sum(axis=1)
+    idx = np.argsort(projection)[-3:]
+    levels = sorted(idx)
 
-    raise RuntimeError("Binance API недоступен")
+    for y in levels:
+        cv2.line(img, (0, y), (w, y), (0, 255, 0), 2)
 
+    # -------- Поиск тренд линии --------
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=150,
+                            minLineLength=100, maxLineGap=20)
 
-def ema(data, period):
-    return np.convolve(data, np.ones(period)/period, mode='valid')
+    if lines is not None:
+        longest = max(lines, key=lambda l: np.linalg.norm(
+            (l[0][2]-l[0][0], l[0][3]-l[0][1])
+        ))
+        x1, y1, x2, y2 = longest[0]
+        cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 3)
 
+    # -------- Стрелка входа --------
+    cv2.arrowedLine(img,
+                    (int(w*0.8), int(h*0.6)),
+                    (int(w*0.8), int(h*0.5)),
+                    (0, 0, 255),
+                    3)
 
-def rsi(data, period=14):
-    delta = np.diff(data)
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
+    output_path = path.replace(".jpg", "_analyzed.jpg")
+    cv2.imwrite(output_path, img)
 
-    avg_gain = np.mean(gain[:period])
-    avg_loss = np.mean(loss[:period])
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return output_path
 
 
 @dp.message(F.text == "/start")
 async def start(message: Message):
-    await message.answer(
-        "Отправь скрин и подпись:\n\n"
-        "<code>BTCUSDT 1H</code>"
-    )
+    await message.answer("Отправь скрин графика. Я разрисую его 😈")
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    caption = message.caption
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
 
-    if not caption:
-        await message.answer("Добавь подпись вида BTCUSDT 1H")
-        return
+    os.makedirs("tmp", exist_ok=True)
+    path = f"tmp/{photo.file_id}.jpg"
 
-    parts = caption.upper().split()
+    await bot.download_file(file.file_path, destination=path)
 
-    if len(parts) != 2:
-        await message.answer("Формат: BTCUSDT 1H")
-        return
+    analyzed_path = analyze_and_draw(path)
 
-    symbol, interval = parts
-
-    interval = interval.lower()
-
-    await message.answer("⏳ Получаю данные...")
-
-    try:
-        closes, highs, lows = fetch_klines(symbol, interval)
-
-        last_price = closes[-1]
-        ema20 = ema(closes, 20)[-1]
-        ema50 = ema(closes, 50)[-1]
-        rsi_val = rsi(closes)
-
-        trend = "Флет"
-        if ema20 > ema50:
-            trend = "Восходящий"
-        elif ema20 < ema50:
-            trend = "Нисходящий"
-
-        response = (
-            f"📊 {symbol} {interval.upper()}\n\n"
-            f"Цена: {last_price:.2f}\n"
-            f"Тренд: {trend}\n"
-            f"EMA20: {ema20:.2f}\n"
-            f"EMA50: {ema50:.2f}\n"
-            f"RSI: {rsi_val:.1f}\n\n"
-            f"⚠️ Не финсовет"
-        )
-
-        await message.answer(response)
-
-    except Exception as e:
-        await message.answer(f"Ошибка: {str(e)}")
+    await message.answer_photo(
+        photo=open(analyzed_path, "rb"),
+        caption="🧠 AI разметил уровни и тренд"
+    )
 
 
 async def main():
