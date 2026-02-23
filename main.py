@@ -18,12 +18,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not found")
 
-BINANCE_BASES = [
+SPOT_BASES = [
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
     "https://data-api.binance.vision",
+]
+
+FUTURES_BASES = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
 ]
 
 SUPPORTED_INTERVALS = {
@@ -35,6 +42,7 @@ TF_PRETTY = {k: k.upper() for k in SUPPORTED_INTERVALS}
 
 MIN_RR_OK = 1.2
 MIN_RR_STRONG = 2.0
+
 
 # =========================
 # BOT
@@ -65,12 +73,6 @@ def rr(entry: float, sl: float, tp: float) -> Optional[float]:
 
 
 def parse_caption(caption: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Examples:
-      BTCUSDT 1H
-      GUAUSDT 1h
-      ETHUSDT 15m
-    """
     if not caption:
         return None, None
     t = re.sub(r"\s+", " ", caption.strip())
@@ -89,59 +91,56 @@ def parse_caption(caption: Optional[str]) -> Tuple[Optional[str], Optional[str]]
 # =========================
 # BINANCE (SPOT + FUTURES)
 # =========================
+def _parse_klines(data):
+    o = np.array([float(x[1]) for x in data], dtype=np.float64)
+    h = np.array([float(x[2]) for x in data], dtype=np.float64)
+    l = np.array([float(x[3]) for x in data], dtype=np.float64)
+    c = np.array([float(x[4]) for x in data], dtype=np.float64)
+    return o, h, l, c
+
+
 def fetch_klines(symbol: str, interval: str, limit: int = 400):
     """
     1) пробуем SPOT: /api/v3/klines
-    2) если 400/404 -> пробуем FUTURES: /fapi/v1/klines
+    2) если символ не найден на споте (400/404) -> FUTURES: /fapi/v1/klines
     Возвращает: (open, high, low, close, market_name)
     """
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     params = {"symbol": symbol, "interval": interval, "limit": limit}
 
-    def _get(base: str, path: str):
-        return requests.get(f"{base}{path}", params=params, headers=headers, timeout=12)
-
-    last_err = None
-
     # --- SPOT ---
-    for base in BINANCE_BASES:
+    spot_last = None
+    spot_symbol_missing = False
+    for base in SPOT_BASES:
         try:
-            r = _get(base, "/api/v3/klines")
+            r = requests.get(f"{base}/api/v3/klines", params=params, headers=headers, timeout=12)
             if r.status_code == 200:
-                data = r.json()
-                o = np.array([float(x[1]) for x in data], dtype=np.float64)
-                h = np.array([float(x[2]) for x in data], dtype=np.float64)
-                l = np.array([float(x[3]) for x in data], dtype=np.float64)
-                c = np.array([float(x[4]) for x in data], dtype=np.float64)
-                return o, h, l, c, "SPOT"
-
+                return (*_parse_klines(r.json()), "SPOT")
             if r.status_code in (400, 404):
-                last_err = f"SPOT {base} -> HTTP {r.status_code}"
-                break
-
-            last_err = f"SPOT {base} -> HTTP {r.status_code}"
+                spot_symbol_missing = True
+            spot_last = f"SPOT {base} -> HTTP {r.status_code}"
         except Exception as e:
-            last_err = f"SPOT {base} -> {e}"
-            continue
+            spot_last = f"SPOT {base} -> {e}"
 
-    # --- FUTURES ---
-    for base in BINANCE_BASES:
+    # если на споте не нашли — пробуем фьючи
+    # (даже если спот отвалился, всё равно пробуем futures)
+    futures_last = None
+    futures_symbol_missing = False
+    for base in FUTURES_BASES:
         try:
-            r = _get(base, "/fapi/v1/klines")
+            r = requests.get(f"{base}/fapi/v1/klines", params=params, headers=headers, timeout=12)
             if r.status_code == 200:
-                data = r.json()
-                o = np.array([float(x[1]) for x in data], dtype=np.float64)
-                h = np.array([float(x[2]) for x in data], dtype=np.float64)
-                l = np.array([float(x[3]) for x in data], dtype=np.float64)
-                c = np.array([float(x[4]) for x in data], dtype=np.float64)
-                return o, h, l, c, "FUTURES"
-
-            last_err = f"FUTURES {base} -> HTTP {r.status_code}"
+                return (*_parse_klines(r.json()), "FUTURES")
+            if r.status_code in (400, 404):
+                futures_symbol_missing = True
+            futures_last = f"FUTURES {base} -> HTTP {r.status_code}"
         except Exception as e:
-            last_err = f"FUTURES {base} -> {e}"
-            continue
+            futures_last = f"FUTURES {base} -> {e}"
 
-    raise RuntimeError(f"Binance API недоступен / символ не найден. Last: {last_err}")
+    # понятная ошибка
+    if spot_symbol_missing and futures_symbol_missing:
+        raise RuntimeError(f"Символ <b>{symbol}</b> не найден на Binance (SPOT и FUTURES).")
+    raise RuntimeError(f"Binance API недоступен. Last: {futures_last or spot_last or 'unknown'}")
 
 
 # =========================
@@ -204,9 +203,9 @@ def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 1
 
 
 # =========================
-# MARKET STRUCTURE + LEVELS
+# STRUCTURE + LEVELS
 # =========================
-def swings(highs: np.ndarray, lows: np.ndarray, k: int = 3) -> Tuple[List[int], List[int]]:
+def swings(highs: np.ndarray, lows: np.ndarray, k: int = 3):
     sh, sl = [], []
     n = len(highs)
     for i in range(k, n - k):
@@ -231,12 +230,7 @@ def structure_type(highs: np.ndarray, lows: np.ndarray) -> str:
     return "Переходная"
 
 
-def pick_levels(price: float, highs: np.ndarray, lows: np.ndarray) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """
-    Return (S1, S2, R1, R2) based on swing lows/highs.
-    S1 closest support below price, S2 next lower.
-    R1 closest resistance above price, R2 next higher.
-    """
+def pick_levels(price: float, highs: np.ndarray, lows: np.ndarray):
     sh, sl = swings(highs, lows, k=3)
     sh_vals = sorted([float(highs[i]) for i in sh[-60:]])
     sl_vals = sorted([float(lows[i]) for i in sl[-60:]])
@@ -254,12 +248,9 @@ def pick_levels(price: float, highs: np.ndarray, lows: np.ndarray) -> Tuple[Opti
 
 
 # =========================
-# IMAGE DRAWING (PREMIUM)
+# IMAGE DRAW
 # =========================
 def crop_chart_area(img: np.ndarray) -> np.ndarray:
-    """
-    Light crop for Telegram/TradingView mobile screenshots.
-    """
     h, w = img.shape[:2]
     x0 = int(w * 0.30) if w > 700 else 0
     y1 = int(h * 0.86) if h > 700 else h
@@ -274,7 +265,7 @@ def price_to_y(price: float, p_min: float, p_max: float, h: int) -> int:
     return max(0, min(h - 1, y))
 
 
-def overlay_rect(img: np.ndarray, y0: int, y1: int, color_bgr: Tuple[int, int, int], alpha: float = 0.18):
+def overlay_rect(img: np.ndarray, y0: int, y1: int, color_bgr, alpha: float = 0.18):
     h, w = img.shape[:2]
     y0 = max(0, min(h - 1, y0))
     y1 = max(0, min(h - 1, y1))
@@ -285,21 +276,17 @@ def overlay_rect(img: np.ndarray, y0: int, y1: int, color_bgr: Tuple[int, int, i
     cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
 
 
-def draw_hline(img: np.ndarray, y: int, color_bgr: Tuple[int, int, int], thickness: int = 2):
+def draw_hline(img: np.ndarray, y: int, color_bgr, thickness: int = 2):
     h, w = img.shape[:2]
     y = max(0, min(h - 1, y))
     cv2.line(img, (0, y), (w, y), color_bgr, thickness)
 
 
-def draw_label_left(img: np.ndarray, y: int, text: str, color_bgr: Tuple[int, int, int]):
-    """
-    Label on LEFT side to avoid price scale on RIGHT.
-    """
+def draw_label_left(img: np.ndarray, y: int, text: str, color_bgr):
     h, w = img.shape[:2]
     y = max(18, min(h - 8, y))
     x0 = 10
     x1 = int(w * 0.45)
-
     cv2.rectangle(img, (x0, y - 18), (x1, y + 8), (255, 255, 255), -1)
     cv2.putText(img, text, (x0 + 6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_bgr, 2, cv2.LINE_AA)
 
@@ -327,40 +314,45 @@ def draw_plan_on_screenshot(in_path: str, plan: dict, highs: np.ndarray, lows: n
 
     zone_pad = float(plan["zone_pad"])
 
-    # zones: S1/R1
-    s1 = plan["S1"]
-    r1 = plan["R1"]
-
+    # zones for S1/R1
+    s1, r1 = plan["S1"], plan["R1"]
     if s1 is not None:
         y = price_to_y(s1, p_min, p_max, h)
-        y0 = price_to_y(s1 - zone_pad, p_min, p_max, h)
-        y1 = price_to_y(s1 + zone_pad, p_min, p_max, h)
-        overlay_rect(img, y0, y1, (0, 200, 0), alpha=0.16)
-        draw_hline(img, y, (0, 170, 0), thickness=2)
+        overlay_rect(
+            img,
+            price_to_y(s1 - zone_pad, p_min, p_max, h),
+            price_to_y(s1 + zone_pad, p_min, p_max, h),
+            (0, 200, 0),
+            alpha=0.16,
+        )
+        draw_hline(img, y, (0, 170, 0), 2)
         draw_label_left(img, y, f"S1 {fmt(s1)}", (0, 140, 0))
 
     if r1 is not None:
         y = price_to_y(r1, p_min, p_max, h)
-        y0 = price_to_y(r1 - zone_pad, p_min, p_max, h)
-        y1 = price_to_y(r1 + zone_pad, p_min, p_max, h)
-        overlay_rect(img, y0, y1, (0, 0, 220), alpha=0.14)
-        draw_hline(img, y, (0, 0, 220), thickness=2)
+        overlay_rect(
+            img,
+            price_to_y(r1 - zone_pad, p_min, p_max, h),
+            price_to_y(r1 + zone_pad, p_min, p_max, h),
+            (0, 0, 220),
+            alpha=0.14,
+        )
+        draw_hline(img, y, (0, 0, 220), 2)
         draw_label_left(img, y, f"R1 {fmt(r1)}", (0, 0, 220))
 
-    # lines: entry/sl/tp1/tp2/tp3
-    def draw_price_line(key: str, color: Tuple[int, int, int]):
+    def draw_key(key: str, color):
         val = plan.get(key)
         if val is None:
             return
         y = price_to_y(float(val), p_min, p_max, h)
-        draw_hline(img, y, color, thickness=1)
+        draw_hline(img, y, color, 1)
         draw_label_left(img, y, f"{key.upper()} {fmt(float(val))}", color)
 
-    draw_price_line("entry", (40, 40, 40))
-    draw_price_line("sl", (0, 0, 220))
-    draw_price_line("tp1", (0, 140, 0))
-    draw_price_line("tp2", (0, 140, 0))
-    draw_price_line("tp3", (0, 140, 0))
+    draw_key("entry", (40, 40, 40))
+    draw_key("sl", (0, 0, 220))
+    draw_key("tp1", (0, 140, 0))
+    draw_key("tp2", (0, 140, 0))
+    draw_key("tp3", (0, 140, 0))
 
     draw_direction_arrow(img, plan["side"])
 
@@ -370,15 +362,11 @@ def draw_plan_on_screenshot(in_path: str, plan: dict, highs: np.ndarray, lows: n
 
 
 # =========================
-# PLAN LOGIC (ONE SCENARIO)
+# PLAN
 # =========================
-def classify_trend(e20: float, e50: float, e200: float, r: float) -> Tuple[str, str]:
-    """
-    Returns (trend_text, side)
-    """
+def classify_trend(e20: float, e50: float, e200: float, r: float):
     if any(math.isnan(x) for x in [e20, e50, e200, r]):
         return "Недостаточно данных", "NEUTRAL"
-
     if e20 > e50 > e200 and r >= 50:
         return "Восходящий", "LONG"
     if e20 < e50 < e200 and r <= 50:
@@ -386,7 +374,7 @@ def classify_trend(e20: float, e50: float, e200: float, r: float) -> Tuple[str, 
     return "Флет/переход", "NEUTRAL"
 
 
-def build_plan(symbol: str, tf: str, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, market: str) -> dict:
+def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, market: str) -> dict:
     price = float(closes[-1])
     e20 = float(ema(closes, 20)[-1])
     e50 = float(ema(closes, 50)[-1])
@@ -396,63 +384,48 @@ def build_plan(symbol: str, tf: str, opens: np.ndarray, highs: np.ndarray, lows:
 
     trend_text, side = classify_trend(e20, e50, e200, r)
     structure = structure_type(highs, lows)
-
     S1, S2, R1, R2 = pick_levels(price, highs, lows)
 
-    # ATR-based pads
     zone_pad = (a * 0.35) if not math.isnan(a) else price * 0.003
     stop_pad = (a * 0.90) if not math.isnan(a) else price * 0.008
 
-    # -------------------------
-    # Entry logic (more pro):
-    # If price is close to the "better" level -> use it.
-    # LONG: prefer entry at R1 (breakout/retest) if close; else at S1 (pullback).
-    # SHORT: prefer entry at R1 (sell rally) if close; else at S1 (breakdown).
-    # -------------------------
     entry = sl = tp1 = tp2 = tp3 = None
 
-    def _is_close(level: Optional[float], to_price: float, thresh: float) -> bool:
-        return level is not None and abs(level - to_price) <= thresh
-
-    close_thresh = (a * 0.55) if not math.isnan(a) else price * 0.0055
-
+    # One main scenario (A)
     if side == "LONG":
-        if _is_close(S1, price, close_thresh) and S1 is not None:
-            # pullback long
+        # prefer pullback from S1, else breakout from R1
+        if S1 is not None:
             entry = S1
-            sl = S2 - stop_pad if S2 is not None else (S1 - stop_pad)
+            sl = (S2 - stop_pad) if S2 is not None else (S1 - stop_pad)
         elif R1 is not None:
-            # breakout/retest long
             entry = R1
-            sl = S1 - stop_pad if S1 is not None else (price - stop_pad)
+            sl = (price - stop_pad)
         else:
             side = "NEUTRAL"
 
         if entry is not None and sl is not None:
             risk = max(1e-9, entry - sl)
-            tp1 = entry + risk * 1.0
-            tp2 = entry + risk * 2.0
-            tp3 = entry + risk * 3.0
+            tp1 = entry + risk * 1
+            tp2 = entry + risk * 2
+            tp3 = entry + risk * 3
 
     elif side == "SHORT":
-        if _is_close(R1, price, close_thresh) and R1 is not None:
-            # sell rally
+        # prefer sell rally from R1, else breakdown from S1
+        if R1 is not None:
             entry = R1
-            sl = R2 + stop_pad if R2 is not None else (R1 + stop_pad)
+            sl = (R2 + stop_pad) if R2 is not None else (R1 + stop_pad)
         elif S1 is not None:
-            # breakdown
             entry = S1
-            sl = R1 + stop_pad if R1 is not None else (price + stop_pad)
+            sl = (price + stop_pad)
         else:
             side = "NEUTRAL"
 
         if entry is not None and sl is not None:
             risk = max(1e-9, sl - entry)
-            tp1 = entry - risk * 1.0
-            tp2 = entry - risk * 2.0
-            tp3 = entry - risk * 3.0
+            tp1 = entry - risk * 1
+            tp2 = entry - risk * 2
+            tp3 = entry - risk * 3
 
-    # quality
     strength = "—"
     rr2 = None
     if entry is not None and sl is not None and tp2 is not None:
@@ -464,7 +437,6 @@ def build_plan(symbol: str, tf: str, opens: np.ndarray, highs: np.ndarray, lows:
         else:
             strength = "⚠️ Слабый"
 
-    # If NEUTRAL -> explain
     if side == "NEUTRAL":
         strength = "⚠️ Сетап не сформирован (флет/нет уровней)"
 
@@ -521,12 +493,12 @@ def build_plan(symbol: str, tf: str, opens: np.ndarray, highs: np.ndarray, lows:
 @dp.message(F.text == "/start")
 async def start(message: Message):
     await message.answer(
-        "Отправь скрин графика + подпись, например:\n"
+        "Отправь скрин + подпись:\n"
         "<code>BTCUSDT 1H</code>\n\n"
-        "Я верну:\n"
-        "• MAX PRO разметку (zones + entry/sl/tp1/tp2/tp3)\n"
-        "• Один главный сценарий (A) по тренду\n"
-        "• Авто SPOT/FUTURES"
+        "MAX PRO:\n"
+        "• авто SPOT/FUTURES\n"
+        "• один сценарий по тренду\n"
+        "• зоны + TP1/TP2/TP3"
     )
 
 
@@ -536,25 +508,18 @@ async def handle_photo(message: Message):
 
     symbol, tf = parse_caption(message.caption)
     if not symbol or not tf:
-        await message.answer("Нужна подпись вида <code>BTCUSDT 1H</code> (или ETHUSDT 15m).")
-        return
-    if not symbol.endswith("USDT"):
-        await message.answer("Сейчас поддерживаются пары, которые заканчиваются на <b>USDT</b>.")
+        await message.answer("Нужна подпись вида <code>BTCUSDT 1H</code>.")
         return
 
     try:
-        # download image
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
-
         os.makedirs("tmp", exist_ok=True)
         in_path = f"tmp/{photo.file_id}.jpg"
         await bot.download_file(file.file_path, destination=in_path)
 
-        # market data (spot -> futures fallback)
         o, h, l, c, market = fetch_klines(symbol, tf, limit=400)
-
-        plan = build_plan(symbol, tf, o, h, l, c, market)
+        plan = build_plan(symbol, tf, h, l, c, market)
         out_path = draw_plan_on_screenshot(in_path, plan, h, l)
 
         await message.answer_photo(photo=FSInputFile(out_path), caption="🧠 MAX PRO разметка готова")
