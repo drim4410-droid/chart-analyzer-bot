@@ -1,3 +1,6 @@
+# main.py — MAX PRO+++ (stable, no "hangs", Binance SPOT+Futures auto, ticker hints)
+# Replace the whole file with this and commit.
+
 import os
 import re
 import math
@@ -28,27 +31,18 @@ TF_PRETTY = {k: k.upper() for k in SUPPORTED_INTERVALS}
 MIN_RR_OK = 1.2
 MIN_RR_STRONG = 2.0
 
+# Use stable primary domains only (mirrors sometimes return 202/edge issues)
+SPOT_BASES = ["https://api.binance.com", "https://data-api.binance.vision"]
+FUT_USDT_BASES = ["https://fapi.binance.com"]   # USDT-M futures
+FUT_COIN_BASES = ["https://dapi.binance.com"]   # COIN-M futures
 
-# Base endpoints for each market
-SPOT_BASES = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://data-api.binance.vision",
-]
-FUT_USDT_BASES = [
-    "https://fapi.binance.com",
-    "https://fapi1.binance.com",
-    "https://fapi2.binance.com",
-    "https://fapi3.binance.com",
-]
-FUT_COIN_BASES = [
-    "https://dapi.binance.com",
-    "https://dapi1.binance.com",
-    "https://dapi2.binance.com",
-    "https://dapi3.binance.com",
-]
+REQ_TIMEOUT = 10
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+# Caches (in-memory)
+_EXINFO_CACHE = {"spot": None, "usdtm": None, "coinm": None}
+_EXINFO_TS = {"spot": 0.0, "usdtm": 0.0, "coinm": 0.0}
+_EXINFO_TTL_SEC = 30 * 60  # 30 min
 
 
 # =========================
@@ -59,7 +53,7 @@ dp = Dispatcher()
 
 
 # =========================
-# GENERIC HELPERS
+# HELPERS
 # =========================
 def fmt(p: Optional[float]) -> str:
     if p is None or (isinstance(p, float) and math.isnan(p)):
@@ -82,27 +76,24 @@ def rr(entry: float, sl: float, tp: float) -> Optional[float]:
 
 def parse_caption(caption: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Expected: BTCUSDT 1H, GUAUSDT 1h, ETHUSDT 15m
+    Expected:
+      BTCUSDT 1H
+      GUAUSDT 1h
+      ETHUSDT 15m
     """
     if not caption:
         return None, None
-
     t = re.sub(r"\s+", " ", caption.strip())
     parts = t.split(" ")
     if len(parts) < 2:
         return None, None
-
     symbol = parts[0].upper().replace("/", "").replace("-", "").replace("_", "")
     tf = parts[1].lower().replace("ч", "h").replace("м", "m").replace("д", "d")
-
     if tf not in SUPPORTED_INTERVALS:
         return symbol, None
     return symbol, tf
 
 
-# =========================
-# BINANCE AUTO: SPOT + USDT-M + COIN-M
-# =========================
 def _parse_klines(data):
     o = np.array([float(x[1]) for x in data], dtype=np.float64)
     h = np.array([float(x[2]) for x in data], dtype=np.float64)
@@ -111,24 +102,106 @@ def _parse_klines(data):
     return o, h, l, c
 
 
+def _safe_get(url: str, params: dict):
+    # 2 attempts total, treat 202 as retry
+    last = None
+    for attempt in range(2):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=REQ_TIMEOUT)
+            if r.status_code == 202:
+                last = r
+                continue
+            return r
+        except Exception as e:
+            last = e
+            continue
+    raise RuntimeError(f"Request failed: {url} ({last})")
+
+
+# =========================
+# EXCHANGEINFO (hints)
+# =========================
+def _now_ts() -> float:
+    # avoid importing time in constrained envs
+    import time
+    return time.time()
+
+
+def _get_exchangeinfo(kind: str):
+    """
+    kind: spot | usdtm | coinm
+    caches for 30 minutes
+    """
+    ts = _now_ts()
+    if _EXINFO_CACHE.get(kind) is not None and (ts - _EXINFO_TS.get(kind, 0.0)) < _EXINFO_TTL_SEC:
+        return _EXINFO_CACHE[kind]
+
+    if kind == "spot":
+        url = f"{SPOT_BASES[0]}/api/v3/exchangeInfo"
+    elif kind == "usdtm":
+        url = f"{FUT_USDT_BASES[0]}/fapi/v1/exchangeInfo"
+    elif kind == "coinm":
+        url = f"{FUT_COIN_BASES[0]}/dapi/v1/exchangeInfo"
+    else:
+        return None
+
+    try:
+        r = _safe_get(url, params={})
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        _EXINFO_CACHE[kind] = js
+        _EXINFO_TS[kind] = ts
+        return js
+    except Exception:
+        return None
+
+
+def suggest_symbols(user_symbol: str, limit: int = 10) -> List[str]:
+    """
+    Suggest real Binance symbols close to base.
+    """
+    base = user_symbol
+    if user_symbol.endswith("USDT"):
+        base = user_symbol[:-4]
+    elif user_symbol.endswith("USDC"):
+        base = user_symbol[:-4]
+
+    suggestions: List[str] = []
+
+    for kind in ("spot", "usdtm", "coinm"):
+        js = _get_exchangeinfo(kind)
+        if not js:
+            continue
+        for s in js.get("symbols", []):
+            sym = s.get("symbol", "")
+            if not sym:
+                continue
+            if base and sym.startswith(base):
+                # show mostly relevant quotes / perp
+                if ("USDT" in sym) or ("USDC" in sym) or ("PERP" in sym) or (sym.endswith("USD")):
+                    suggestions.append(sym)
+
+    # unique
+    uniq = []
+    seen = set()
+    for x in suggestions:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+        if len(uniq) >= limit:
+            break
+    return uniq
+
+
+# =========================
+# BINANCE AUTO FETCH (spot/usdt-m/coin-m)
+# =========================
 def fetch_klines_auto(symbol: str, interval: str, limit: int = 400):
     """
-    AUTO:
-      1) SPOT        /api/v3/klines
-      2) USDT-M      /fapi/v1/klines
-      3) COIN-M      /dapi/v1/klines
-
-    + tries symbol variants:
-      - 1000{BASE}USDT
-      - {BASE}USDC
-      - 1000{BASE}USDC
-      - COIN-M fallback: {BASE}USD_PERP
-
     Returns: (open, high, low, close, market_name, used_symbol)
     """
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-
-    # Build candidates
+    # build candidate tickers
     base = symbol
     quote = ""
     if symbol.endswith("USDT"):
@@ -144,108 +217,63 @@ def fetch_klines_auto(symbol: str, interval: str, limit: int = 400):
     elif quote == "USDC":
         candidates += [f"1000{base}USDC", f"{base}USDT", f"1000{base}USDT"]
 
-    # Dedup keep order
+    # de-dup
     seen = set()
     candidates = [x for x in candidates if not (x in seen or seen.add(x))]
 
-    def _try_market(bases: List[str], path: str, sym: str):
-        last = None
-        for base_url in bases:
+    def try_bases(bases: List[str], path: str, sym: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        for b in bases:
+            url = f"{b}{path}"
+            params = {"symbol": sym, "interval": interval, "limit": limit}
             try:
-                r = requests.get(
-                    f"{base_url}{path}",
-                    params={"symbol": sym, "interval": interval, "limit": limit},
-                    headers=headers,
-                    timeout=12,
-                )
+                r = _safe_get(url, params=params)
                 if r.status_code == 200:
-                    return _parse_klines(r.json()), (base_url, r.status_code, "OK")
-                last = (base_url, r.status_code, (r.text or "")[:200])
-            except Exception as e:
-                last = (base_url, "EXC", str(e)[:200])
-        return None, last
+                    return _parse_klines(r.json())
+                # 4xx: symbol/interval issues, try next symbol
+                # 5xx: server issue, try next base
+                continue
+            except Exception:
+                continue
+        return None
 
     # 1) SPOT
-    spot_last = None
     for sym in candidates:
-        res, last = _try_market(SPOT_BASES, "/api/v3/klines", sym)
-        spot_last = last
+        res = try_bases(SPOT_BASES, "/api/v3/klines", sym)
         if res is not None:
             o, h, l, c = res
             return o, h, l, c, "SPOT", sym
 
-    # 2) USDT-M Futures
-    fut_last = None
+    # 2) USDT-M futures
     for sym in candidates:
-        res, last = _try_market(FUT_USDT_BASES, "/fapi/v1/klines", sym)
-        fut_last = last
+        res = try_bases(FUT_USDT_BASES, "/fapi/v1/klines", sym)
         if res is not None:
             o, h, l, c = res
             return o, h, l, c, "FUTURES-USDTM", sym
 
-    # 3) COIN-M Futures
+    # 3) COIN-M futures
     coin_candidates = list(candidates)
-    # common COIN-M pattern for perpetual contracts
-    if quote == "USDT":
-        coin_candidates += [f"{base}USD_PERP", f"1000{base}USD_PERP"]
-    elif quote == "USDC":
+    # common COIN-M perpetual format
+    if quote in ("USDT", "USDC"):
         coin_candidates += [f"{base}USD_PERP", f"1000{base}USD_PERP"]
 
     seen2 = set()
     coin_candidates = [x for x in coin_candidates if not (x in seen2 or seen2.add(x))]
 
-    coin_last = None
     for sym in coin_candidates:
-        res, last = _try_market(FUT_COIN_BASES, "/dapi/v1/klines", sym)
-        coin_last = last
+        res = try_bases(FUT_COIN_BASES, "/dapi/v1/klines", sym)
         if res is not None:
             o, h, l, c = res
             return o, h, l, c, "FUTURES-COINM", sym
 
-    # If not found -> suggestions from exchangeInfo
-    def _suggest_from_exchangeinfo() -> List[str]:
-        suggestions = []
-
-        def add_suggestions(url: str, key: str = "symbols", symbol_key: str = "symbol"):
-            try:
-                r = requests.get(url, headers=headers, timeout=12)
-                if r.status_code != 200:
-                    return
-                js = r.json()
-                for s in js.get(key, []):
-                    sym = s.get(symbol_key, "")
-                    if not sym:
-                        continue
-                    # Suggest only close to base
-                    if base and sym.startswith(base):
-                        if ("USDT" in sym) or ("USDC" in sym) or ("PERP" in sym) or ("USD" in sym):
-                            suggestions.append(sym)
-            except Exception:
-                return
-
-        add_suggestions(f"{SPOT_BASES[0]}/api/v3/exchangeInfo")
-        add_suggestions(f"{FUT_USDT_BASES[0]}/fapi/v1/exchangeInfo")
-        add_suggestions(f"{FUT_COIN_BASES[0]}/dapi/v1/exchangeInfo")
-
-        uniq = []
-        sset = set()
-        for x in suggestions:
-            if x not in sset:
-                sset.add(x)
-                uniq.append(x)
-        return uniq[:10]
-
-    sugg = _suggest_from_exchangeinfo()
+    # Not found -> suggestions
+    sugg = suggest_symbols(symbol, limit=10)
     if sugg:
         raise RuntimeError(
-            f"Символ <b>{symbol}</b> не найден по подписи.\n"
+            f"Символ <b>{symbol}</b> не найден.\n"
             f"Похожие тикеры на Binance: <code>{', '.join(sugg)}</code>\n"
-            f"Отправь скрин с подписью, например: <code>{sugg[0]} 1H</code>"
+            f"Попробуй, например: <code>{sugg[0]} {TF_PRETTY.get(interval, interval)}</code>"
         )
-
-    # else raw last info
-    last = coin_last or fut_last or spot_last or ("unknown", "?", "")
-    raise RuntimeError(f"Символ не найден / API недоступен. Last: {last}")
+    raise RuntimeError(f"Символ <b>{symbol}</b> не найден на Binance (spot/usdt-m/coin-m).")
 
 
 # =========================
@@ -266,7 +294,6 @@ def ema(arr: np.ndarray, period: int) -> np.ndarray:
 def rsi(arr: np.ndarray, period: int = 14) -> np.ndarray:
     if len(arr) < period + 1:
         return np.full_like(arr, np.nan)
-
     diff = np.diff(arr)
     gain = np.where(diff > 0, diff, 0.0)
     loss = np.where(diff < 0, -diff, 0.0)
@@ -275,7 +302,6 @@ def rsi(arr: np.ndarray, period: int = 14) -> np.ndarray:
     avg_loss = np.empty(len(arr))
     avg_gain[:] = np.nan
     avg_loss[:] = np.nan
-
     avg_gain[period] = np.mean(gain[:period])
     avg_loss[period] = np.mean(loss[:period])
 
@@ -292,13 +318,11 @@ def rsi(arr: np.ndarray, period: int = 14) -> np.ndarray:
 def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
     if len(closes) < period + 1:
         return np.full_like(closes, np.nan)
-
     prev_close = closes[:-1]
     tr = np.maximum(
         highs[1:] - lows[1:],
         np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)),
     )
-
     out = np.empty_like(closes)
     out[:] = np.nan
     out[period] = np.mean(tr[:period])
@@ -325,10 +349,8 @@ def structure_type(highs: np.ndarray, lows: np.ndarray) -> str:
     sh, sl = swings(highs, lows, k=3)
     if len(sh) < 2 or len(sl) < 2:
         return "Неопределённо"
-
     last_h, prev_h = highs[sh[-1]], highs[sh[-2]]
     last_l, prev_l = lows[sl[-1]], lows[sl[-2]]
-
     if last_h < prev_h and last_l < prev_l:
         return "LL/LH (нисходящая структура)"
     if last_h > prev_h and last_l > prev_l:
@@ -337,9 +359,6 @@ def structure_type(highs: np.ndarray, lows: np.ndarray) -> str:
 
 
 def pick_levels(price: float, highs: np.ndarray, lows: np.ndarray):
-    """
-    Return (S1,S2,R1,R2) from swing lows/highs
-    """
     sh, sl = swings(highs, lows, k=3)
     sh_vals = sorted([float(highs[i]) for i in sh[-80:]])
     sl_vals = sorted([float(lows[i]) for i in sl[-80:]])
@@ -355,12 +374,9 @@ def pick_levels(price: float, highs: np.ndarray, lows: np.ndarray):
 
 
 # =========================
-# IMAGE DRAWING
+# IMAGE DRAW
 # =========================
 def crop_chart_area(img: np.ndarray) -> np.ndarray:
-    """
-    Light crop for Telegram/TradingView mobile screenshots.
-    """
     h, w = img.shape[:2]
     x0 = int(w * 0.30) if w > 700 else 0
     y1 = int(h * 0.86) if h > 700 else h
@@ -393,9 +409,6 @@ def draw_hline(img: np.ndarray, y: int, color_bgr, thickness: int = 2):
 
 
 def draw_label_left(img: np.ndarray, y: int, text: str, color_bgr):
-    """
-    Label on LEFT side to avoid price scale on RIGHT.
-    """
     h, w = img.shape[:2]
     y = max(18, min(h - 8, y))
     x0 = 10
@@ -427,9 +440,7 @@ def draw_plan_on_screenshot(in_path: str, plan: dict, highs: np.ndarray, lows: n
     p_max = float(np.max(highs[-200:]))
     zone_pad = float(plan["zone_pad"])
 
-    # Zones for S1/R1
-    s1 = plan["S1"]
-    r1 = plan["R1"]
+    s1, r1 = plan["S1"], plan["R1"]
 
     if s1 is not None:
         y = price_to_y(s1, p_min, p_max, h)
@@ -467,13 +478,13 @@ def draw_plan_on_screenshot(in_path: str, plan: dict, highs: np.ndarray, lows: n
 
     draw_direction_arrow(img, plan["side"])
 
-    out_path = in_path.replace(".jpg", "_maxpro++.jpg")
+    out_path = in_path.replace(".jpg", "_maxpro_stable.jpg")
     cv2.imwrite(out_path, img)
     return out_path
 
 
 # =========================
-# PLAN LOGIC (ONE SCENARIO)
+# PLAN LOGIC (ONE SCENARIO A)
 # =========================
 def classify_trend(e20: float, e50: float, e200: float, r: float) -> Tuple[str, str]:
     if any(math.isnan(x) for x in [e20, e50, e200, r]):
@@ -504,9 +515,7 @@ def build_plan(symbol_raw: str, used_symbol: str, tf: str, highs: np.ndarray, lo
 
     entry = sl = tp1 = tp2 = tp3 = None
 
-    # One main scenario (A)
     if side == "LONG":
-        # Prefer pullback from S1, else breakout from R1
         if S1 is not None:
             entry = S1
             sl = (S2 - stop_pad) if S2 is not None else (S1 - stop_pad)
@@ -523,7 +532,6 @@ def build_plan(symbol_raw: str, used_symbol: str, tf: str, highs: np.ndarray, lo
             tp3 = entry + risk * 3
 
     elif side == "SHORT":
-        # Prefer sell rally from R1, else breakdown from S1
         if R1 is not None:
             entry = R1
             sl = (R2 + stop_pad) if R2 is not None else (R1 + stop_pad)
@@ -583,19 +591,9 @@ def build_plan(symbol_raw: str, used_symbol: str, tf: str, highs: np.ndarray, lo
         "side": side,
         "structure": structure,
         "rsi": r,
-        "ema20": e20,
-        "ema50": e50,
-        "ema200": e200,
         "atr": a,
-        "S1": S1,
-        "S2": S2,
-        "R1": R1,
-        "R2": R2,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
+        "S1": S1, "S2": S2, "R1": R1, "R2": R2,
+        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
         "zone_pad": zone_pad,
         "rr2": rr2,
         "report": report,
@@ -610,7 +608,7 @@ async def start(message: Message):
     await message.answer(
         "Отправь скрин графика + подпись, например:\n"
         "<code>BTCUSDT 1H</code>\n\n"
-        "MAX PRO++:\n"
+        "MAX PRO+++ (stable):\n"
         "• авто SPOT/USDT-M/COIN-M\n"
         "• подсказки тикеров если не найдено\n"
         "• один сценарий по тренду\n"
@@ -620,7 +618,7 @@ async def start(message: Message):
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    await message.answer("⏳ Анализирую (Binance auto: spot/futures)...")
+    await message.answer("⏳ Анализирую (stable)...")
 
     symbol, tf = parse_caption(message.caption)
     if not symbol or not tf:
@@ -628,21 +626,19 @@ async def handle_photo(message: Message):
         return
 
     try:
-        # Download image
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
+
         os.makedirs("tmp", exist_ok=True)
         in_path = f"tmp/{photo.file_id}.jpg"
         await bot.download_file(file.file_path, destination=in_path)
 
-        # Fetch data
         o, h, l, c, market, used_symbol = fetch_klines_auto(symbol, tf, limit=400)
-
-        # Build plan + draw
         plan = build_plan(symbol, used_symbol, tf, h, l, c, market)
+
         out_path = draw_plan_on_screenshot(in_path, plan, h, l)
 
-        await message.answer_photo(photo=FSInputFile(out_path), caption="🧠 MAX PRO++ разметка готова")
+        await message.answer_photo(photo=FSInputFile(out_path), caption="🧠 MAX PRO+++ разметка готова")
         await message.answer(plan["report"])
 
     except Exception as e:
