@@ -17,7 +17,13 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://data-api.binance.vision",
+]
 
 
 # ---------- Parsing helpers ----------
@@ -130,18 +136,44 @@ class MarketStats:
 
 
 def fetch_klines(symbol: str, interval: str, limit: int = 300) -> MarketStats:
-    url = f"{BINANCE_BASE}/api/v3/klines"
+    url_path = "/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
 
-    closes = np.array([float(x[4]) for x in data], dtype=np.float64)
-    highs = np.array([float(x[2]) for x in data], dtype=np.float64)
-    lows = np.array([float(x[3]) for x in data], dtype=np.float64)
-    last_price = float(closes[-1])
+    last_err = None
 
-    return MarketStats(
+    for base in BINANCE_BASES:
+        try:
+            r = requests.get(f"{base}{url_path}", params=params, headers=headers, timeout=15)
+
+            if r.status_code != 200:
+                last_err = f"{base} -> HTTP {r.status_code}"
+                continue
+
+            data = r.json()
+
+            closes = np.array([float(x[4]) for x in data], dtype=np.float64)
+            highs = np.array([float(x[2]) for x in data], dtype=np.float64)
+            lows = np.array([float(x[3]) for x in data], dtype=np.float64)
+            last_price = float(closes[-1])
+
+            return MarketStats(
+                symbol=symbol,
+                interval=interval,
+                closes=closes,
+                highs=highs,
+                lows=lows,
+                last_price=last_price,
+            )
+
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    raise RuntimeError(f"Binance endpoints unavailable: {last_err}")
         symbol=symbol,
         interval=interval,
         closes=closes,
