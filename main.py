@@ -18,21 +18,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not found")
 
-SPOT_BASES = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://data-api.binance.vision",
-]
-
-FUTURES_BASES = [
-    "https://fapi.binance.com",
-    "https://fapi1.binance.com",
-    "https://fapi2.binance.com",
-    "https://fapi3.binance.com",
-]
-
 SUPPORTED_INTERVALS = {
     "1m","3m","5m","15m","30m",
     "1h","2h","4h","6h","8h","12h",
@@ -44,6 +29,28 @@ MIN_RR_OK = 1.2
 MIN_RR_STRONG = 2.0
 
 
+# Base endpoints for each market
+SPOT_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://data-api.binance.vision",
+]
+FUT_USDT_BASES = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+]
+FUT_COIN_BASES = [
+    "https://dapi.binance.com",
+    "https://dapi1.binance.com",
+    "https://dapi2.binance.com",
+    "https://dapi3.binance.com",
+]
+
+
 # =========================
 # BOT
 # =========================
@@ -52,14 +59,15 @@ dp = Dispatcher()
 
 
 # =========================
-# HELPERS
+# GENERIC HELPERS
 # =========================
 def fmt(p: Optional[float]) -> str:
     if p is None or (isinstance(p, float) and math.isnan(p)):
         return "—"
-    if abs(p) >= 1000:
+    ap = abs(float(p))
+    if ap >= 1000:
         return f"{p:,.0f}".replace(",", " ")
-    if abs(p) >= 1:
+    if ap >= 1:
         return f"{p:,.2f}".replace(",", " ")
     return f"{p:.6f}"
 
@@ -73,8 +81,12 @@ def rr(entry: float, sl: float, tp: float) -> Optional[float]:
 
 
 def parse_caption(caption: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Expected: BTCUSDT 1H, GUAUSDT 1h, ETHUSDT 15m
+    """
     if not caption:
         return None, None
+
     t = re.sub(r"\s+", " ", caption.strip())
     parts = t.split(" ")
     if len(parts) < 2:
@@ -89,7 +101,7 @@ def parse_caption(caption: Optional[str]) -> Tuple[Optional[str], Optional[str]]
 
 
 # =========================
-# BINANCE (SPOT + FUTURES)
+# BINANCE AUTO: SPOT + USDT-M + COIN-M
 # =========================
 def _parse_klines(data):
     o = np.array([float(x[1]) for x in data], dtype=np.float64)
@@ -99,48 +111,141 @@ def _parse_klines(data):
     return o, h, l, c
 
 
-def fetch_klines(symbol: str, interval: str, limit: int = 400):
+def fetch_klines_auto(symbol: str, interval: str, limit: int = 400):
     """
-    1) пробуем SPOT: /api/v3/klines
-    2) если символ не найден на споте (400/404) -> FUTURES: /fapi/v1/klines
-    Возвращает: (open, high, low, close, market_name)
+    AUTO:
+      1) SPOT        /api/v3/klines
+      2) USDT-M      /fapi/v1/klines
+      3) COIN-M      /dapi/v1/klines
+
+    + tries symbol variants:
+      - 1000{BASE}USDT
+      - {BASE}USDC
+      - 1000{BASE}USDC
+      - COIN-M fallback: {BASE}USD_PERP
+
+    Returns: (open, high, low, close, market_name, used_symbol)
     """
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
 
-    # --- SPOT ---
+    # Build candidates
+    base = symbol
+    quote = ""
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+        quote = "USDT"
+    elif symbol.endswith("USDC"):
+        base = symbol[:-4]
+        quote = "USDC"
+
+    candidates = [symbol]
+    if quote == "USDT":
+        candidates += [f"1000{base}USDT", f"{base}USDC", f"1000{base}USDC"]
+    elif quote == "USDC":
+        candidates += [f"1000{base}USDC", f"{base}USDT", f"1000{base}USDT"]
+
+    # Dedup keep order
+    seen = set()
+    candidates = [x for x in candidates if not (x in seen or seen.add(x))]
+
+    def _try_market(bases: List[str], path: str, sym: str):
+        last = None
+        for base_url in bases:
+            try:
+                r = requests.get(
+                    f"{base_url}{path}",
+                    params={"symbol": sym, "interval": interval, "limit": limit},
+                    headers=headers,
+                    timeout=12,
+                )
+                if r.status_code == 200:
+                    return _parse_klines(r.json()), (base_url, r.status_code, "OK")
+                last = (base_url, r.status_code, (r.text or "")[:200])
+            except Exception as e:
+                last = (base_url, "EXC", str(e)[:200])
+        return None, last
+
+    # 1) SPOT
     spot_last = None
-    spot_symbol_missing = False
-    for base in SPOT_BASES:
-        try:
-            r = requests.get(f"{base}/api/v3/klines", params=params, headers=headers, timeout=12)
-            if r.status_code == 200:
-                return (*_parse_klines(r.json()), "SPOT")
-            if r.status_code in (400, 404):
-                spot_symbol_missing = True
-            spot_last = f"SPOT {base} -> HTTP {r.status_code}"
-        except Exception as e:
-            spot_last = f"SPOT {base} -> {e}"
+    for sym in candidates:
+        res, last = _try_market(SPOT_BASES, "/api/v3/klines", sym)
+        spot_last = last
+        if res is not None:
+            o, h, l, c = res
+            return o, h, l, c, "SPOT", sym
 
-    # если на споте не нашли — пробуем фьючи
-    # (даже если спот отвалился, всё равно пробуем futures)
-    futures_last = None
-    futures_symbol_missing = False
-    for base in FUTURES_BASES:
-        try:
-            r = requests.get(f"{base}/fapi/v1/klines", params=params, headers=headers, timeout=12)
-            if r.status_code == 200:
-                return (*_parse_klines(r.json()), "FUTURES")
-            if r.status_code in (400, 404):
-                futures_symbol_missing = True
-            futures_last = f"FUTURES {base} -> HTTP {r.status_code}"
-        except Exception as e:
-            futures_last = f"FUTURES {base} -> {e}"
+    # 2) USDT-M Futures
+    fut_last = None
+    for sym in candidates:
+        res, last = _try_market(FUT_USDT_BASES, "/fapi/v1/klines", sym)
+        fut_last = last
+        if res is not None:
+            o, h, l, c = res
+            return o, h, l, c, "FUTURES-USDTM", sym
 
-    # понятная ошибка
-    if spot_symbol_missing and futures_symbol_missing:
-        raise RuntimeError(f"Символ <b>{symbol}</b> не найден на Binance (SPOT и FUTURES).")
-    raise RuntimeError(f"Binance API недоступен. Last: {futures_last or spot_last or 'unknown'}")
+    # 3) COIN-M Futures
+    coin_candidates = list(candidates)
+    # common COIN-M pattern for perpetual contracts
+    if quote == "USDT":
+        coin_candidates += [f"{base}USD_PERP", f"1000{base}USD_PERP"]
+    elif quote == "USDC":
+        coin_candidates += [f"{base}USD_PERP", f"1000{base}USD_PERP"]
+
+    seen2 = set()
+    coin_candidates = [x for x in coin_candidates if not (x in seen2 or seen2.add(x))]
+
+    coin_last = None
+    for sym in coin_candidates:
+        res, last = _try_market(FUT_COIN_BASES, "/dapi/v1/klines", sym)
+        coin_last = last
+        if res is not None:
+            o, h, l, c = res
+            return o, h, l, c, "FUTURES-COINM", sym
+
+    # If not found -> suggestions from exchangeInfo
+    def _suggest_from_exchangeinfo() -> List[str]:
+        suggestions = []
+
+        def add_suggestions(url: str, key: str = "symbols", symbol_key: str = "symbol"):
+            try:
+                r = requests.get(url, headers=headers, timeout=12)
+                if r.status_code != 200:
+                    return
+                js = r.json()
+                for s in js.get(key, []):
+                    sym = s.get(symbol_key, "")
+                    if not sym:
+                        continue
+                    # Suggest only close to base
+                    if base and sym.startswith(base):
+                        if ("USDT" in sym) or ("USDC" in sym) or ("PERP" in sym) or ("USD" in sym):
+                            suggestions.append(sym)
+            except Exception:
+                return
+
+        add_suggestions(f"{SPOT_BASES[0]}/api/v3/exchangeInfo")
+        add_suggestions(f"{FUT_USDT_BASES[0]}/fapi/v1/exchangeInfo")
+        add_suggestions(f"{FUT_COIN_BASES[0]}/dapi/v1/exchangeInfo")
+
+        uniq = []
+        sset = set()
+        for x in suggestions:
+            if x not in sset:
+                sset.add(x)
+                uniq.append(x)
+        return uniq[:10]
+
+    sugg = _suggest_from_exchangeinfo()
+    if sugg:
+        raise RuntimeError(
+            f"Символ <b>{symbol}</b> не найден по подписи.\n"
+            f"Похожие тикеры на Binance: <code>{', '.join(sugg)}</code>\n"
+            f"Отправь скрин с подписью, например: <code>{sugg[0]} 1H</code>"
+        )
+
+    # else raw last info
+    last = coin_last or fut_last or spot_last or ("unknown", "?", "")
+    raise RuntimeError(f"Символ не найден / API недоступен. Last: {last}")
 
 
 # =========================
@@ -205,7 +310,7 @@ def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 1
 # =========================
 # STRUCTURE + LEVELS
 # =========================
-def swings(highs: np.ndarray, lows: np.ndarray, k: int = 3):
+def swings(highs: np.ndarray, lows: np.ndarray, k: int = 3) -> Tuple[List[int], List[int]]:
     sh, sl = [], []
     n = len(highs)
     for i in range(k, n - k):
@@ -220,6 +325,7 @@ def structure_type(highs: np.ndarray, lows: np.ndarray) -> str:
     sh, sl = swings(highs, lows, k=3)
     if len(sh) < 2 or len(sl) < 2:
         return "Неопределённо"
+
     last_h, prev_h = highs[sh[-1]], highs[sh[-2]]
     last_l, prev_l = lows[sl[-1]], lows[sl[-2]]
 
@@ -231,26 +337,30 @@ def structure_type(highs: np.ndarray, lows: np.ndarray) -> str:
 
 
 def pick_levels(price: float, highs: np.ndarray, lows: np.ndarray):
+    """
+    Return (S1,S2,R1,R2) from swing lows/highs
+    """
     sh, sl = swings(highs, lows, k=3)
-    sh_vals = sorted([float(highs[i]) for i in sh[-60:]])
-    sl_vals = sorted([float(lows[i]) for i in sl[-60:]])
+    sh_vals = sorted([float(highs[i]) for i in sh[-80:]])
+    sl_vals = sorted([float(lows[i]) for i in sl[-80:]])
 
     supports = [x for x in sl_vals if x < price]
     resists = [x for x in sh_vals if x > price]
 
     s1 = supports[-1] if len(supports) >= 1 else None
     s2 = supports[-2] if len(supports) >= 2 else None
-
     r1 = resists[0] if len(resists) >= 1 else None
     r2 = resists[1] if len(resists) >= 2 else None
-
     return s1, s2, r1, r2
 
 
 # =========================
-# IMAGE DRAW
+# IMAGE DRAWING
 # =========================
 def crop_chart_area(img: np.ndarray) -> np.ndarray:
+    """
+    Light crop for Telegram/TradingView mobile screenshots.
+    """
     h, w = img.shape[:2]
     x0 = int(w * 0.30) if w > 700 else 0
     y1 = int(h * 0.86) if h > 700 else h
@@ -283,10 +393,13 @@ def draw_hline(img: np.ndarray, y: int, color_bgr, thickness: int = 2):
 
 
 def draw_label_left(img: np.ndarray, y: int, text: str, color_bgr):
+    """
+    Label on LEFT side to avoid price scale on RIGHT.
+    """
     h, w = img.shape[:2]
     y = max(18, min(h - 8, y))
     x0 = 10
-    x1 = int(w * 0.45)
+    x1 = int(w * 0.46)
     cv2.rectangle(img, (x0, y - 18), (x1, y + 8), (255, 255, 255), -1)
     cv2.putText(img, text, (x0 + 6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_bgr, 2, cv2.LINE_AA)
 
@@ -306,37 +419,35 @@ def draw_plan_on_screenshot(in_path: str, plan: dict, highs: np.ndarray, lows: n
     img_full = cv2.imread(in_path)
     if img_full is None:
         raise RuntimeError("cv2.imread: не смог прочитать изображение")
-    img = crop_chart_area(img_full)
 
+    img = crop_chart_area(img_full)
     h, w = img.shape[:2]
+
     p_min = float(np.min(lows[-200:]))
     p_max = float(np.max(highs[-200:]))
-
     zone_pad = float(plan["zone_pad"])
 
-    # zones for S1/R1
-    s1, r1 = plan["S1"], plan["R1"]
+    # Zones for S1/R1
+    s1 = plan["S1"]
+    r1 = plan["R1"]
+
     if s1 is not None:
         y = price_to_y(s1, p_min, p_max, h)
-        overlay_rect(
-            img,
-            price_to_y(s1 - zone_pad, p_min, p_max, h),
-            price_to_y(s1 + zone_pad, p_min, p_max, h),
-            (0, 200, 0),
-            alpha=0.16,
-        )
+        overlay_rect(img,
+                     price_to_y(s1 - zone_pad, p_min, p_max, h),
+                     price_to_y(s1 + zone_pad, p_min, p_max, h),
+                     (0, 200, 0),
+                     alpha=0.16)
         draw_hline(img, y, (0, 170, 0), 2)
         draw_label_left(img, y, f"S1 {fmt(s1)}", (0, 140, 0))
 
     if r1 is not None:
         y = price_to_y(r1, p_min, p_max, h)
-        overlay_rect(
-            img,
-            price_to_y(r1 - zone_pad, p_min, p_max, h),
-            price_to_y(r1 + zone_pad, p_min, p_max, h),
-            (0, 0, 220),
-            alpha=0.14,
-        )
+        overlay_rect(img,
+                     price_to_y(r1 - zone_pad, p_min, p_max, h),
+                     price_to_y(r1 + zone_pad, p_min, p_max, h),
+                     (0, 0, 220),
+                     alpha=0.14)
         draw_hline(img, y, (0, 0, 220), 2)
         draw_label_left(img, y, f"R1 {fmt(r1)}", (0, 0, 220))
 
@@ -356,15 +467,15 @@ def draw_plan_on_screenshot(in_path: str, plan: dict, highs: np.ndarray, lows: n
 
     draw_direction_arrow(img, plan["side"])
 
-    out_path = in_path.replace(".jpg", "_maxpro.jpg")
+    out_path = in_path.replace(".jpg", "_maxpro++.jpg")
     cv2.imwrite(out_path, img)
     return out_path
 
 
 # =========================
-# PLAN
+# PLAN LOGIC (ONE SCENARIO)
 # =========================
-def classify_trend(e20: float, e50: float, e200: float, r: float):
+def classify_trend(e20: float, e50: float, e200: float, r: float) -> Tuple[str, str]:
     if any(math.isnan(x) for x in [e20, e50, e200, r]):
         return "Недостаточно данных", "NEUTRAL"
     if e20 > e50 > e200 and r >= 50:
@@ -374,8 +485,9 @@ def classify_trend(e20: float, e50: float, e200: float, r: float):
     return "Флет/переход", "NEUTRAL"
 
 
-def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, market: str) -> dict:
+def build_plan(symbol_raw: str, used_symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, market: str) -> dict:
     price = float(closes[-1])
+
     e20 = float(ema(closes, 20)[-1])
     e50 = float(ema(closes, 50)[-1])
     e200 = float(ema(closes, 200)[-1])
@@ -384,6 +496,7 @@ def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes
 
     trend_text, side = classify_trend(e20, e50, e200, r)
     structure = structure_type(highs, lows)
+
     S1, S2, R1, R2 = pick_levels(price, highs, lows)
 
     zone_pad = (a * 0.35) if not math.isnan(a) else price * 0.003
@@ -393,7 +506,7 @@ def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes
 
     # One main scenario (A)
     if side == "LONG":
-        # prefer pullback from S1, else breakout from R1
+        # Prefer pullback from S1, else breakout from R1
         if S1 is not None:
             entry = S1
             sl = (S2 - stop_pad) if S2 is not None else (S1 - stop_pad)
@@ -410,7 +523,7 @@ def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes
             tp3 = entry + risk * 3
 
     elif side == "SHORT":
-        # prefer sell rally from R1, else breakdown from S1
+        # Prefer sell rally from R1, else breakdown from S1
         if R1 is not None:
             entry = R1
             sl = (R2 + stop_pad) if R2 is not None else (R1 + stop_pad)
@@ -441,7 +554,8 @@ def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes
         strength = "⚠️ Сетап не сформирован (флет/нет уровней)"
 
     report = (
-        f"📊 <b>{symbol}</b> — <b>{TF_PRETTY.get(tf, tf)}</b> <i>({market})</i>\n"
+        f"📊 <b>{symbol_raw}</b> — <b>{TF_PRETTY.get(tf, tf)}</b>\n"
+        f"🔗 Использую: <code>{used_symbol}</code> <i>({market})</i>\n"
         f"💰 Цена: <b>{fmt(price)}</b>\n\n"
         f"🔻 Тренд: <b>{trend_text}</b>\n"
         f"📐 Структура: <b>{structure}</b>\n"
@@ -460,7 +574,8 @@ def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes
     )
 
     return {
-        "symbol": symbol,
+        "symbol_raw": symbol_raw,
+        "used_symbol": used_symbol,
         "tf": tf,
         "market": market,
         "price": price,
@@ -493,10 +608,11 @@ def build_plan(symbol: str, tf: str, highs: np.ndarray, lows: np.ndarray, closes
 @dp.message(F.text == "/start")
 async def start(message: Message):
     await message.answer(
-        "Отправь скрин + подпись:\n"
+        "Отправь скрин графика + подпись, например:\n"
         "<code>BTCUSDT 1H</code>\n\n"
-        "MAX PRO:\n"
-        "• авто SPOT/FUTURES\n"
+        "MAX PRO++:\n"
+        "• авто SPOT/USDT-M/COIN-M\n"
+        "• подсказки тикеров если не найдено\n"
         "• один сценарий по тренду\n"
         "• зоны + TP1/TP2/TP3"
     )
@@ -504,7 +620,7 @@ async def start(message: Message):
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    await message.answer("⏳ Анализирую рынок...")
+    await message.answer("⏳ Анализирую (Binance auto: spot/futures)...")
 
     symbol, tf = parse_caption(message.caption)
     if not symbol or not tf:
@@ -512,21 +628,25 @@ async def handle_photo(message: Message):
         return
 
     try:
+        # Download image
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
         os.makedirs("tmp", exist_ok=True)
         in_path = f"tmp/{photo.file_id}.jpg"
         await bot.download_file(file.file_path, destination=in_path)
 
-        o, h, l, c, market = fetch_klines(symbol, tf, limit=400)
-        plan = build_plan(symbol, tf, h, l, c, market)
+        # Fetch data
+        o, h, l, c, market, used_symbol = fetch_klines_auto(symbol, tf, limit=400)
+
+        # Build plan + draw
+        plan = build_plan(symbol, used_symbol, tf, h, l, c, market)
         out_path = draw_plan_on_screenshot(in_path, plan, h, l)
 
-        await message.answer_photo(photo=FSInputFile(out_path), caption="🧠 MAX PRO разметка готова")
+        await message.answer_photo(photo=FSInputFile(out_path), caption="🧠 MAX PRO++ разметка готова")
         await message.answer(plan["report"])
 
     except Exception as e:
-        await message.answer(f"❌ Ошибка: <code>{type(e).__name__}: {str(e)[:250]}</code>")
+        await message.answer(f"❌ Ошибка: <code>{type(e).__name__}: {str(e)[:900]}</code>")
 
 
 async def main():
